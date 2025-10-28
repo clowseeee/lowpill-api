@@ -1,5 +1,6 @@
 const { createClient } = require('@supabase/supabase-js');
 const { z } = require('zod');
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE);
 
 const schema = z.object({
   company: z.string(),
@@ -30,6 +31,12 @@ const schema = z.object({
 });
 
 module.exports = async (req, res) => {
+
+  // Authorization guard
+  if (req.headers.authorization !== `Bearer ${process.env.INGEST_TOKEN}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
   try {
     if (req.method === 'GET') return res.status(200).send('pong');
 
