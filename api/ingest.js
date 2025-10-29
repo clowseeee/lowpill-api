@@ -223,7 +223,7 @@ const sourceId = srcCheck.id;
 
         factRows.push({
           company_id: company.id,
-          source_id: sourceID,
+          source_id: sourceId,
           as_of_date: f.as_of_date ? new Date(f.as_of_date) : null,
           domain: f.domain || null,
           metric_key: f.metric_key,
