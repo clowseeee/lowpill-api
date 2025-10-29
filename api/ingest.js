@@ -204,7 +204,8 @@ const { data: srcCheck, error: srcCheckErr } = await supabase
   .maybeSingle();
 
 if (srcCheckErr || !srcCheck) {
-  return res.status(500).json({ error: `source lookup failed before inserts` });
+  return re
+s.status(500).json({ error: `source lookup failed before inserts` });
 }
 const sourceId = srcCheck.id;
 
@@ -222,7 +223,7 @@ const sourceId = srcCheck.id;
 
         factRows.push({
           company_id: company.id,
-          source_id: sourceRow.id,
+          source_id: sourceID,
           as_of_date: f.as_of_date ? new Date(f.as_of_date) : null,
           domain: f.domain || null,
           metric_key: f.metric_key,
@@ -244,7 +245,7 @@ const sourceId = srcCheck.id;
     if (parsed.insights?.length) {
       const insightRows = parsed.insights.map(i => ({
         company_id: company.id,
-        source_id: sourceRow.id,
+        source_id: sourceId,
         theme_enum: mapThemeEnum(i.theme),
         theme: i.theme || null,
         text: i.text,
@@ -254,7 +255,7 @@ const sourceId = srcCheck.id;
       if (iErr && iErr.code !== '23505') return res.status(500).json({ error: `insights insert: ${iErr.message}` });
     }
 
-    return res.status(200).json({ ok: true, company: slug, source_id: sourceRow.id });
+    return res.status(200).json({ ok: true, company: slug, source_id: sourceId });
   } catch (err) {
     console.error('INGEST ERROR:', err);
     return res.status(500).json({ error: err?.message || 'unknown' });
