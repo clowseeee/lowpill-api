@@ -166,7 +166,35 @@ module.exports = async (req, res) => {
       version,
       source_md5
     });
+// --- Safety check: ensure sourceRow.id truly exists in public.sources
+{
+  const { data: exists, error: exErr } = await supabase
+    .from('sources')
+    .select('id')
+    .eq('id', sourceRow.id)
+    .maybeSingle();
 
+  if (exErr) {
+    return res.status(500).json({ error: `source verify: ${exErr.message}` });
+  }
+
+  if (!exists) {
+    // Fallback: re-fetch by (company_id, url) and override id
+    const { data: fallback, error: fbErr } = await supabase
+      .from('sources')
+      .select('id')
+      .eq('company_id', company.id)
+      .eq('url', parsed.source.url)
+      .order('published_at', { ascending: false, nullsFirst: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (fbErr || !fallback) {
+      return res.status(500).json({ error: 'source id not found after insert/select' });
+    }
+    sourceRow.id = fallback.id; // <— on force l’ID existant en base
+  }
+}
     // Facts
     if (parsed.facts?.length) {
       const factRows = [];
