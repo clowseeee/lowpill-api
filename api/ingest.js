@@ -194,7 +194,20 @@ module.exports = async (req, res) => {
     }
     sourceRow.id = fallback.id; // <— on force l’ID existant en base
   }
+} 
+// --- ALWAYS resolve a canonical sourceId from DB by (company_id, url)
+const { data: srcCheck, error: srcCheckErr } = await supabase
+  .from('sources')
+  .select('id')
+  .eq('company_id', company.id)
+  .eq('url', parsed.source.url)
+  .maybeSingle();
+
+if (srcCheckErr || !srcCheck) {
+  return res.status(500).json({ error: `source lookup failed before inserts` });
 }
+const sourceId = srcCheck.id;
+
     // Facts
     if (parsed.facts?.length) {
       const factRows = [];
