@@ -1,9 +1,9 @@
 {
   "version": 2,
-  "functions": {
-    "api/ingest.js": { "runtime": "nodejs20.x" },
-    "api/ping.ts":   { "runtime": "nodejs20.x" }
-  },
+  "builds": [
+    { "src": "api/ingest.js", "use": "@vercel/node" },
+    { "src": "api/ping.ts",   "use": "@vercel/node" }
+  ],
   "routes": [
     { "src": "/api/ingest", "dest": "/api/ingest.js" },
     { "src": "/api/ping",   "dest": "/api/ping.ts" }
