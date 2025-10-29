@@ -1,4 +1,4 @@
-// /api/ingest.js — Lowpill v1.6 (robuste, idempotent)
+// /api/ingest.js — Lowpill v1.6 (robuste, idempotent, FK-safe)
 const { createClient } = require('@supabase/supabase-js');
 const { z } = require('zod');
 const crypto = require('crypto');
@@ -10,8 +10,14 @@ const INGEST_TOKEN = process.env.INGEST_TOKEN;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
 
 // --------- utils ----------
-const toSlug = (s) => s.trim().toLowerCase();
+const toSlug = (s) => (s || '').trim().toLowerCase();
 const md5 = (s) => crypto.createHash('md5').update(s || '').digest('hex');
+
+function safeDate(input) {
+  if (!input) return null;
+  const t = new Date(input);
+  return isNaN(t.getTime()) ? null : t;
+}
 
 function parseNumeric(x) {
   if (x == null) return null;
@@ -26,7 +32,7 @@ function norm01(v) {
   if (v == null) return null;
   let x = Number(v);
   if (!Number.isFinite(x)) return null;
-  if (x > 1.0001) x = x / 100;
+  if (x > 1.0001) x = x / 100; // tolère 95 -> 0.95
   if (x < 0) x = 0;
   if (x > 1) x = 1;
   return x;
@@ -89,26 +95,36 @@ const schema = z.object({
   })).optional()
 });
 
-// --------- helper: get or create Source ----------
-async function getOrCreateSource(supabase, { companyId, url, title, source_type, published_at, doc_language, version, source_md5 }) {
-  // 1) chercher d'abord par (company_id, url)
-  const { data: found, error: selErr } = await supabase
+// --------- helpers ----------
+async function getOrCreateCompany(name) {
+  const slug = toSlug(name);
+  const { data, error } = await supabase
+    .from('companies')
+    .upsert({ slug, name }, { onConflict: 'slug' })
+    .select()
+    .single();
+  if (error) throw new Error(`company upsert: ${error.message}`);
+  return data;
+}
+
+// Sélectionne d'abord (company_id, url). Si absent, tente l'insert,
+// puis re-sélectionne pour récupérer l'ID effectivement en base.
+async function getOrCreateSource({ company_id, url, title, source_type, published_at, doc_language, version, source_md5 }) {
+  const sel1 = await supabase
     .from('sources')
     .select('*')
-    .eq('company_id', companyId)
+    .eq('company_id', company_id)
     .eq('url', url)
     .order('published_at', { ascending: false, nullsFirst: false })
     .limit(1)
     .maybeSingle();
+  if (sel1.error) throw new Error(`source select: ${sel1.error.message}`);
+  if (sel1.data) return sel1.data;
 
-  if (selErr) throw new Error(`source select: ${selErr.message}`);
-  if (found) return found;
-
-  // 2) sinon insérer
   const ins = await supabase
     .from('sources')
     .insert({
-      company_id: companyId,
+      company_id,
       url,
       title,
       source_type,
@@ -120,7 +136,21 @@ async function getOrCreateSource(supabase, { companyId, url, title, source_type,
     .select()
     .single();
 
-  if (ins.error) throw new Error(`source insert: ${ins.error.message}`);
+  if (ins.error) {
+    // Conflit (unique) potentiel : reselect après tentative d'insert
+    const sel2 = await supabase
+      .from('sources')
+      .select('*')
+      .eq('company_id', company_id)
+      .eq('url', url)
+      .order('published_at', { ascending: false, nullsFirst: false })
+      .limit(1)
+      .maybeSingle();
+    if (sel2.error || !sel2.data) {
+      throw new Error(`source insert: ${ins.error.message}`);
+    }
+    return sel2.data;
+  }
   return ins.data;
 }
 
@@ -140,24 +170,18 @@ module.exports = async (req, res) => {
     const parsed = schema.parse(body);
 
     // Company
-    const slug = toSlug(parsed.company);
-    const { data: company, error: cErr } = await supabase
-      .from('companies')
-      .upsert({ slug, name: parsed.company }, { onConflict: 'slug' })
-      .select()
-      .single();
-    if (cErr) return res.status(500).json({ error: `company upsert: ${cErr.message}` });
+    const company = await getOrCreateCompany(parsed.company);
 
-    // Source fields
-    const source_md5 = parsed.source.source_md5 || null;
+    // Source fields normalisés
     const source_type = mapDocTypeEnum(parsed.source.doc_type);
-    const published_at = parsed.source.published_at ? new Date(parsed.source.published_at) : null;
+    const published_at = safeDate(parsed.source.published_at);
+    const source_md5 = parsed.source.source_md5 || null;
     const doc_language = parsed.source.doc_language || null;
     const version = parsed.source.version ?? 1;
 
-    // Source (robuste, idempotent)
-    const sourceRow = await getOrCreateSource(supabase, {
-      companyId: company.id,
+    // Source (idempotent)
+    const sourceRow = await getOrCreateSource({
+      company_id: company.id,
       url: parsed.source.url,
       title: parsed.source.title,
       source_type,
@@ -166,48 +190,18 @@ module.exports = async (req, res) => {
       version,
       source_md5
     });
-// --- Safety check: ensure sourceRow.id truly exists in public.sources
-{
-  const { data: exists, error: exErr } = await supabase
-    .from('sources')
-    .select('id')
-    .eq('id', sourceRow.id)
-    .maybeSingle();
 
-  if (exErr) {
-    return res.status(500).json({ error: `source verify: ${exErr.message}` });
-  }
-
-  if (!exists) {
-    // Fallback: re-fetch by (company_id, url) and override id
-    const { data: fallback, error: fbErr } = await supabase
+    // Canonical sourceId: re-lookup par (company_id, url) pour éviter tout décalage d’ID
+    const { data: srcCheck, error: srcCheckErr } = await supabase
       .from('sources')
       .select('id')
       .eq('company_id', company.id)
       .eq('url', parsed.source.url)
-      .order('published_at', { ascending: false, nullsFirst: false })
-      .limit(1)
       .maybeSingle();
-
-    if (fbErr || !fallback) {
-      return res.status(500).json({ error: 'source id not found after insert/select' });
+    if (srcCheckErr || !srcCheck) {
+      return res.status(500).json({ error: 'source lookup failed before inserts' });
     }
-    sourceRow.id = fallback.id; // <— on force l’ID existant en base
-  }
-} 
-// --- ALWAYS resolve a canonical sourceId from DB by (company_id, url)
-const { data: srcCheck, error: srcCheckErr } = await supabase
-  .from('sources')
-  .select('id')
-  .eq('company_id', company.id)
-  .eq('url', parsed.source.url)
-  .maybeSingle();
-
-if (srcCheckErr || !srcCheck) {
-  return re
-s.status(500).json({ error: `source lookup failed before inserts` });
-}
-const sourceId = srcCheck.id;
+    const sourceId = srcCheck.id;
 
     // Facts
     if (parsed.facts?.length) {
@@ -219,12 +213,14 @@ const sourceId = srcCheck.id;
           .upsert({ key_slug, label: f.metric_key }, { onConflict: 'key_slug' })
           .select()
           .single();
-        if (dict.error) return res.status(500).json({ error: `metrics_dictionary upsert: ${dict.error.message}` });
+        if (dict.error) {
+          return res.status(500).json({ error: `metrics_dictionary upsert: ${dict.error.message}` });
+        }
 
         factRows.push({
           company_id: company.id,
-          source_id: sourceId,
-          as_of_date: f.as_of_date ? new Date(f.as_of_date) : null,
+          source_id: sourceId, // FK-safe
+          as_of_date: safeDate(f.as_of_date),
           domain: f.domain || null,
           metric_key: f.metric_key,
           metric_id: dict.data.id,
@@ -238,24 +234,34 @@ const sourceId = srcCheck.id;
         });
       }
       const { error: fErr } = await supabase.from('facts').insert(factRows);
-      if (fErr && fErr.code !== '23505') return res.status(500).json({ error: `facts insert: ${fErr.message}` });
+      if (fErr && fErr.code !== '23505') {
+        return res.status(500).json({
+          error: `facts insert: ${fErr.message}`,
+          debug: { sourceIdUsed: factRows?.[0]?.source_id, companyId: company.id }
+        });
+      }
     }
 
     // Insights
     if (parsed.insights?.length) {
       const insightRows = parsed.insights.map(i => ({
         company_id: company.id,
-        source_id: sourceId,
+        source_id: sourceId, // FK-safe
         theme_enum: mapThemeEnum(i.theme),
         theme: i.theme || null,
         text: i.text,
         confidence: norm01(i.confidence)
       }));
       const { error: iErr } = await supabase.from('insights').insert(insightRows);
-      if (iErr && iErr.code !== '23505') return res.status(500).json({ error: `insights insert: ${iErr.message}` });
+      if (iErr && iErr.code !== '23505') {
+        return res.status(500).json({
+          error: `insights insert: ${iErr.message}`,
+          debug: { sourceIdUsed: insightRows?.[0]?.source_id, companyId: company.id }
+        });
+      }
     }
 
-    return res.status(200).json({ ok: true, company: slug, source_id: sourceId });
+    return res.status(200).json({ ok: true, company: toSlug(parsed.company), source_id: sourceId });
   } catch (err) {
     console.error('INGEST ERROR:', err);
     return res.status(500).json({ error: err?.message || 'unknown' });
