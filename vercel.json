@@ -1,11 +1,7 @@
 {
   "version": 2,
   "builds": [
-    { "src": "api/ingest.js", "use": "@vercel/node" },
-    { "src": "api/ping.ts",   "use": "@vercel/node" }
-  ],
-  "routes": [
-    { "src": "/api/ingest", "dest": "/api/ingest.js" },
-    { "src": "/api/ping",   "dest": "/api/ping.ts" }
+    { "src": "api/*.js", "use": "@vercel/node" },
+    { "src": "api/*.ts", "use": "@vercel/node" }
   ]
 }
