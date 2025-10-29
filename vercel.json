@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "functions": {
+    "api/ingest.js": { "runtime": "nodejs20.x" },
+    "api/ping.ts":   { "runtime": "nodejs20.x" }
+  },
+  "routes": [
+    { "src": "/api/ingest", "dest": "/api/ingest.js" },
+    { "src": "/api/ping",   "dest": "/api/ping.ts" }
+  ]
+}
