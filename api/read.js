@@ -1,96 +1,3 @@
-// /api/read.js — retourne un payload “produit” pour Willo + Front
-const { createClient } = require('@supabase/supabase-js');
-
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
-
-module.exports = async (req, res) => {
-  try {
-    const { company, metric, limit = 8 } = req.query || {};
-    if (!company) {
-      return res.status(400).json({ error: 'Missing ?company=<slug or name>' });
-    }
-
-    // 1) Résoudre le slug → id/slug
-    const { data: comp, error: cErr } = await supabase
-      .from('companies')
-      .select('id, slug, name, domain')
-      .or(`slug.eq.${company},name.ilike.%${company}%`)
-      .limit(1)
-      .maybeSingle();
-    if (cErr) return res.status(500).json({ error: cErr.message });
-    if (!comp) return res.status(404).json({ error: 'Company not found' });
-
-    // 2) Facts analytiques (plus)
-    let q = supabase
-      .from('fact_analysis_plus')
-      .select('*')
-      .eq('company_slug', comp.slug)
-      .order('as_of_date', { ascending: false })
-      .limit(limit);
-
-    if (metric) q = q.eq('metric_key', metric);
-
-    const { data: facts, error: fErr } = await q;
-    if (fErr) return res.status(500).json({ error: fErr.message });
-
-    // 3) Narratifs
-    let nq = supabase
-      .from('fact_narratives')
-      .select('*')
-      .eq('company_slug', comp.slug)
-      .order('as_of_date', { ascending: false })
-      .limit(limit);
-
-    if (metric) nq = nq.eq('metric_key', metric);
-
-    const { data: narr, error: nErr } = await nq;
-    if (nErr) return res.status(500).json({ error: nErr.message });
-
-    // 4) Regroupement produit
-    const metrics = {};
-    for (const row of facts || []) {
-      if (!metrics[row.metric_key]) metrics[row.metric_key] = { series: [], last: null };
-      metrics[row.metric_key].series.push({
-        date: row.as_of_date,
-        value: row.metric_value_num,
-        yoy: row.yoy_change,
-        qoq: row.qoq_change,
-        trend: row.trend,
-        signal: row.signal_strength,
-        zscore_sector: row.zscore_sector
-      });
-    }
-    // Dernier point par metric
-    for (const k of Object.keys(metrics)) {
-      metrics[k].series.sort((a,b) => new Date(b.date) - new Date(a.date));
-      metrics[k].last = metrics[k].series[0];
-    }
-
-    // 5) Narratifs simplifiés
-    const narratives = (narr || []).map(n => ({
-      date: n.as_of_date,
-      metric: n.metric_key,
-      fr: n.narrative_fr,
-      en: n.narrative_en,
-      yoy: n.yoy_change,
-      qoq: n.qoq_change,
-      trend: n.trend,
-      signal: n.signal_strength
-    }));
-
-    return res.status(200).json({
-      company: { slug: comp.slug, name: comp.name, domain: comp.domain },
-      metrics,
-      narratives
-    });
-  } catch (err) {
-    console.error('READ ERROR:', err);
-    return res.status(500).json({ error: err?.message || 'unknown' });
-  }
-};
 // /api/read.js — Lowpill v1.6 (read + provenance-aware)
 const { createClient } = require('@supabase/supabase-js');
 const { z } = require('zod');
@@ -114,17 +21,16 @@ const querySchema = z.object({
 
 // -------- compute helpers ----------
 function computeChanges(series) {
-  // series: [{date, value}] sorted asc by date
   for (let i = 0; i < series.length; i++) {
     const cur = series[i];
     const prev = i > 0 ? series[i - 1] : null;
     cur.qoq = prev && isFiniteNum(prev.value) && prev.value !== 0
       ? Number(((100 * (cur.value - prev.value)) / prev.value).toFixed(2))
       : null;
-
-    // YOY naïf = même index -1 si périodicité inconnue; si tu veux YOY vrai, passe via ta vue SQL
-    cur.yoy = cur.qoq; // fallback simple si pas de périodicité
-    cur.trend = isFiniteNum(cur.qoq) ? (cur.qoq > 0 ? 'up' : (cur.qoq < 0 ? 'down' : 'flat')) : 'flat';
+    cur.yoy = cur.qoq;
+    cur.trend = isFiniteNum(cur.qoq)
+      ? (cur.qoq > 0 ? 'up' : (cur.qoq < 0 ? 'down' : 'flat'))
+      : 'flat';
   }
   return series;
 }
@@ -144,7 +50,6 @@ module.exports = async (req, res) => {
       return res.status(405).json({ error: 'Method not allowed' });
     }
 
-    // 1) Parse & validate query
     const parsed = querySchema.parse({
       company: req.query.company,
       metric: req.query.metric,
@@ -154,7 +59,7 @@ module.exports = async (req, res) => {
 
     const slug = toSlug(parsed.company);
 
-    // 2) Company
+    // 1) Company
     const { data: company, error: cErr } = await supabase
       .from('companies')
       .select('id, slug, name, domain')
@@ -163,7 +68,7 @@ module.exports = async (req, res) => {
     if (cErr) return res.status(500).json({ error: `company select: ${cErr.message}` });
     if (!company) return res.status(404).json({ error: 'company not found' });
 
-    // 3) Metrics (optionnel si ?metric=)
+    // 2) Metrics
     let metrics = {};
     if (parsed.metric) {
       const { data: factRows, error: fErr } = await supabase
@@ -182,10 +87,6 @@ module.exports = async (req, res) => {
 
       const last = series.length ? series[series.length - 1] : null;
 
-      // Z-score sector (si dispo dans ta vue matérielle, sinon null)
-      // Ici on laisse null par défaut — tu peux lier ta vue fact_analysis_sector pour enrichir.
-      const zscore_sector = null;
-
       metrics[parsed.metric] = {
         series: series.map(s => ({
           date: s.date,
@@ -193,8 +94,8 @@ module.exports = async (req, res) => {
           yoy: s.yoy,
           qoq: s.qoq,
           trend: s.trend,
-          signal: scoreToSignal(Math.abs((s.qoq ?? 0) / 100)), // signal simple basé sur variation
-          zscore_sector
+          signal: scoreToSignal(Math.abs((s.qoq ?? 0) / 100)),
+          zscore_sector: null
         })),
         last: last ? {
           date: last.date,
@@ -203,18 +104,15 @@ module.exports = async (req, res) => {
           qoq: last.qoq,
           trend: last.trend,
           signal: scoreToSignal(Math.abs((last.qoq ?? 0) / 100)),
-          zscore_sector
+          zscore_sector: null
         } : null
       };
     }
 
-    // 4) Insights + provenance (tri par provenance_score)
+    // 3) Insights + provenance
     const lim = parsed.limit ?? 5;
-
-    // filtre par thème éventuel
     const themeFilter = parsed.theme ? { theme_enum: toSlug(parsed.theme) } : {};
 
-    // On calcule le score dans SQL pour être robuste même si NULLs
     const { data: insights, error: iErr } = await supabase
       .from('insights')
       .select(`
@@ -226,7 +124,7 @@ module.exports = async (req, res) => {
       `)
       .eq('company_id', company.id)
       .match(themeFilter)
-      .order('created_at', { ascending: false }); // on récupère large puis on filtre/score côté app
+      .order('created_at', { ascending: false });
 
     if (iErr) return res.status(500).json({ error: `insights select: ${iErr.message}` });
 
@@ -255,12 +153,10 @@ module.exports = async (req, res) => {
       };
     });
 
-    // Tri desc par provenance_score puis date
     enriched.sort((a, b) => (b.provenance_score - a.provenance_score) || (new Date(b.date) - new Date(a.date)));
 
     const topInsights = enriched.slice(0, lim);
 
-    // 5) Agrégats utiles pour le front
     const avgProv = topInsights.length
       ? Number((topInsights.reduce((s, x) => s + (x.provenance_score ?? 0), 0) / topInsights.length).toFixed(3))
       : null;
@@ -271,7 +167,6 @@ module.exports = async (req, res) => {
       return acc;
     }, {});
 
-    // 6) Narratives simples (si metric présent)
     const narratives = [];
     if (parsed.metric && metrics[parsed.metric]?.series?.length) {
       for (const s of metrics[parsed.metric].series) {
@@ -292,10 +187,9 @@ module.exports = async (req, res) => {
       }
     }
 
-    // 7) Réponse
     return res.status(200).json({
       company: { slug: company.slug, name: company.name, domain: company.domain ?? null },
-      metrics, // vide si pas de ?metric=
+      metrics,
       insights: {
         top: topInsights,
         aggregates: {
