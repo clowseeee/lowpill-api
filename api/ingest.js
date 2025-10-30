@@ -1,4 +1,4 @@
-// /api/ingest.js — Lowpill v1.6 (robuste, idempotent, FK-safe)
+// /api/ingest.js — Lowpill v1.7 (idempotent, FK-safe, provenance-aware)
 const { createClient } = require('@supabase/supabase-js');
 const { z } = require('zod');
 const crypto = require('crypto');
@@ -9,7 +9,7 @@ const INGEST_TOKEN = process.env.INGEST_TOKEN;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
 
-// --------- utils ----------
+// ---------- utils ----------
 const toSlug = (s) => (s || '').trim().toLowerCase();
 const md5 = (s) => crypto.createHash('md5').update(s || '').digest('hex');
 
@@ -18,26 +18,22 @@ function safeDate(input) {
   const t = new Date(input);
   return isNaN(t.getTime()) ? null : t;
 }
-
 function parseNumeric(x) {
   if (x == null) return null;
   let s = String(x).trim();
   s = s.replace(/%/g, '').replace(/\s/g, '').replace(/,/g, '');
   const n = Number(s);
-  if (!Number.isFinite(n)) return null;
-  return n;
+  return Number.isFinite(n) ? n : null;
 }
-
 function norm01(v) {
   if (v == null) return null;
   let x = Number(v);
   if (!Number.isFinite(x)) return null;
-  if (x > 1.0001) x = x / 100; // tolère 95 -> 0.95
+  if (x > 1.0001) x = x / 100; // 95 -> 0.95 toléré
   if (x < 0) x = 0;
   if (x > 1) x = 1;
   return x;
 }
-
 function mapThemeEnum(t) {
   if (!t) return 'other';
   const m = String(t).toLowerCase();
@@ -52,7 +48,6 @@ function mapThemeEnum(t) {
   if (['moat','avantage','barrier'].includes(m)) return 'moat';
   return 'other';
 }
-
 function mapDocTypeEnum(t) {
   if (!t) return 'other';
   const m = String(t).toLowerCase();
@@ -65,7 +60,45 @@ function mapDocTypeEnum(t) {
   return 'other';
 }
 
-// --------- schema ----------
+// ---------- provenance ----------
+const PROVENANCE_RULES = [
+  { pattern: /(^|\.)lvmh\.com$/i,         type: 'issuer',    name: 'LVMH',          trust: 0.70 },
+  { pattern: /(^|\.)sec\.gov$/i,          type: 'regulator', name: 'SEC',           trust: 0.95 },
+  { pattern: /(^|\.)amf-france\.org$/i,   type: 'regulator', name: 'AMF',           trust: 0.95 },
+  { pattern: /(^|\.)euronext\.com$/i,     type: 'exchange',  name: 'Euronext',      trust: 0.90 },
+  { pattern: /(^|\.)businesswire\.com$/i, type: 'newswire',  name: 'BusinessWire',  trust: 0.80 },
+  { pattern: /(^|\.)prnewswire\.com$/i,   type: 'newswire',  name: 'PR Newswire',   trust: 0.80 },
+  { pattern: /(^|\.)reuters\.com$/i,      type: 'media',     name: 'Reuters',       trust: 0.85 },
+  { pattern: /(^|\.)bloomberg\.com$/i,    type: 'media',     name: 'Bloomberg',     trust: 0.85 },
+  { pattern: /(^|\.)seekingalpha\.com$/i, type: 'analyst',   name: 'Seeking Alpha', trust: 0.70 },
+];
+function classifyProvenance(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    for (const r of PROVENANCE_RULES) {
+      if (r.pattern.test(host)) {
+        return {
+          publisher_domain: host,
+          publisher_name:   r.name,
+          publisher_type:   r.type,            // issuer | regulator | exchange | newswire | analyst | media | other
+          is_official:      ['issuer','regulator','exchange'].includes(r.type),
+          trust_score:      r.trust            // 0..1
+        };
+      }
+    }
+    return {
+      publisher_domain: host,
+      publisher_name:   host,
+      publisher_type:   'other',
+      is_official:      false,
+      trust_score:      0.50
+    };
+  } catch {
+    return { publisher_domain: null, publisher_name: null, publisher_type: 'other', is_official: false, trust_score: 0.50 };
+  }
+}
+
+// ---------- schema ----------
 const schema = z.object({
   company: z.string().min(1),
   source: z.object({
@@ -95,7 +128,7 @@ const schema = z.object({
   })).optional()
 });
 
-// --------- helpers ----------
+// ---------- helpers ----------
 async function getOrCreateCompany(name) {
   const slug = toSlug(name);
   const { data, error } = await supabase
@@ -107,9 +140,11 @@ async function getOrCreateCompany(name) {
   return data;
 }
 
-// Sélectionne d'abord (company_id, url). Si absent, tente l'insert,
+// Sélectionne d'abord (company_id, url). Si absent, insère avec provenance,
 // puis re-sélectionne pour récupérer l'ID effectivement en base.
-async function getOrCreateSource({ company_id, url, title, source_type, published_at, doc_language, version, source_md5 }) {
+async function getOrCreateSource({
+  company_id, url, title, source_type, published_at, doc_language, version, source_md5, provenance
+}) {
   const sel1 = await supabase
     .from('sources')
     .select('*')
@@ -131,13 +166,18 @@ async function getOrCreateSource({ company_id, url, title, source_type, publishe
       published_at,
       source_md5,
       doc_language,
-      version
+      version,
+      // provenance fields
+      publisher_domain: provenance.publisher_domain,
+      publisher_name:   provenance.publisher_name,
+      publisher_type:   provenance.publisher_type,
+      is_official:      provenance.is_official,
+      trust_score:      provenance.trust_score
     })
     .select()
     .single();
 
   if (ins.error) {
-    // Conflit (unique) potentiel : reselect après tentative d'insert
     const sel2 = await supabase
       .from('sources')
       .select('*')
@@ -154,7 +194,7 @@ async function getOrCreateSource({ company_id, url, title, source_type, publishe
   return ins.data;
 }
 
-// --------- handler ----------
+// ---------- handler ----------
 module.exports = async (req, res) => {
   try {
     // Auth
@@ -173,13 +213,14 @@ module.exports = async (req, res) => {
     const company = await getOrCreateCompany(parsed.company);
 
     // Source fields normalisés
-    const source_type = mapDocTypeEnum(parsed.source.doc_type);
+    const source_type  = mapDocTypeEnum(parsed.source.doc_type);
     const published_at = safeDate(parsed.source.published_at);
-    const source_md5 = parsed.source.source_md5 || null;
+    const source_md5   = parsed.source.source_md5 || null;
     const doc_language = parsed.source.doc_language || null;
-    const version = parsed.source.version ?? 1;
+    const version      = parsed.source.version ?? 1;
+    const provenance   = classifyProvenance(parsed.source.url);
 
-    // Source (idempotent)
+    // Source (idempotent + provenance)
     const sourceRow = await getOrCreateSource({
       company_id: company.id,
       url: parsed.source.url,
@@ -188,20 +229,22 @@ module.exports = async (req, res) => {
       published_at,
       doc_language,
       version,
-      source_md5
+      source_md5,
+      provenance
     });
 
-    // Canonical sourceId: re-lookup par (company_id, url) pour éviter tout décalage d’ID
+    // Canonical sourceId via (company_id, url)
     const { data: srcCheck, error: srcCheckErr } = await supabase
       .from('sources')
-      .select('id')
+      .select('id, trust_score')
       .eq('company_id', company.id)
       .eq('url', parsed.source.url)
       .maybeSingle();
     if (srcCheckErr || !srcCheck) {
       return res.status(500).json({ error: 'source lookup failed before inserts' });
     }
-    const sourceId = srcCheck.id;
+    const sourceId   = srcCheck.id;
+    const trustScore = srcCheck.trust_score ?? provenance.trust_score ?? 0.5;
 
     // Facts
     if (parsed.facts?.length) {
@@ -242,16 +285,20 @@ module.exports = async (req, res) => {
       }
     }
 
-    // Insights
+    // Insights (pondérés par la provenance)
     if (parsed.insights?.length) {
-      const insightRows = parsed.insights.map(i => ({
-        company_id: company.id,
-        source_id: sourceId, // FK-safe
-        theme_enum: mapThemeEnum(i.theme),
-        theme: i.theme || null,
-        text: i.text,
-        confidence: norm01(i.confidence)
-      }));
+      const insightRows = parsed.insights.map(i => {
+        const conf = norm01(i.confidence) ?? 0.8;
+        return {
+          company_id: company.id,
+          source_id:  sourceId, // FK-safe
+          theme_enum: mapThemeEnum(i.theme),
+          theme:      i.theme || null,
+          text:       i.text,
+          confidence: conf,
+          provenance_score: conf * trustScore
+        };
+      });
       const { error: iErr } = await supabase.from('insights').insert(insightRows);
       if (iErr && iErr.code !== '23505') {
         return res.status(500).json({
