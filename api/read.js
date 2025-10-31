@@ -54,6 +54,7 @@ module.exports = async (req, res) => {
         .eq('company_id', company.id)
         .eq('metric_key', parsed.metric)
         .not('as_of_date', 'is', null)
+        .distinct(['as_of_date', 'metric_value_num'])
         .order('as_of_date', { ascending: true });
 
       if (fErr) return res.status(500).json({ error: `facts select: ${fErr.message}` });
