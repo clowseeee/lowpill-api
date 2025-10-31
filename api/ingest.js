@@ -1,4 +1,4 @@
-// /api/ingest.js — Lowpill v1.7 (idempotent, FK-safe, provenance-aware)
+// /api/ingest.js — Lowpill v1.7 (idempotent, FK-safe, provenance-aware + news)
 const { createClient } = require('@supabase/supabase-js');
 const { z } = require('zod');
 const crypto = require('crypto');
@@ -29,7 +29,7 @@ function norm01(v) {
   if (v == null) return null;
   let x = Number(v);
   if (!Number.isFinite(x)) return null;
-  if (x > 1.0001) x = x / 100; // 95 -> 0.95 toléré
+  if (x > 1.0001) x = x / 100; // tolère 95 -> 0.95
   if (x < 0) x = 0;
   if (x > 1) x = 1;
   return x;
@@ -80,19 +80,13 @@ function classifyProvenance(url) {
         return {
           publisher_domain: host,
           publisher_name:   r.name,
-          publisher_type:   r.type,            // issuer | regulator | exchange | newswire | analyst | media | other
+          publisher_type:   r.type,
           is_official:      ['issuer','regulator','exchange'].includes(r.type),
-          trust_score:      r.trust            // 0..1
+          trust_score:      r.trust
         };
       }
     }
-    return {
-      publisher_domain: host,
-      publisher_name:   host,
-      publisher_type:   'other',
-      is_official:      false,
-      trust_score:      0.50
-    };
+    return { publisher_domain: host, publisher_name: host, publisher_type: 'other', is_official: false, trust_score: 0.50 };
   } catch {
     return { publisher_domain: null, publisher_name: null, publisher_type: 'other', is_official: false, trust_score: 0.50 };
   }
@@ -125,6 +119,15 @@ const schema = z.object({
     theme: z.string().optional(),
     text: z.string().min(1),
     confidence: z.number().optional()
+  })).optional(),
+  // 🆕 News supportée par l’API
+  news: z.array(z.object({
+    event_date: z.string().optional(),
+    headline: z.string().min(1),
+    summary: z.string().optional(),
+    full_text: z.string().optional(),
+    theme: z.string().optional(),
+    importance: z.number().optional()
   })).optional()
 });
 
@@ -140,8 +143,6 @@ async function getOrCreateCompany(name) {
   return data;
 }
 
-// Sélectionne d'abord (company_id, url). Si absent, insère avec provenance,
-// puis re-sélectionne pour récupérer l'ID effectivement en base.
 async function getOrCreateSource({
   company_id, url, title, source_type, published_at, doc_language, version, source_md5, provenance
 }) {
@@ -167,7 +168,6 @@ async function getOrCreateSource({
       source_md5,
       doc_language,
       version,
-      // provenance fields
       publisher_domain: provenance.publisher_domain,
       publisher_name:   provenance.publisher_name,
       publisher_type:   provenance.publisher_type,
@@ -197,22 +197,18 @@ async function getOrCreateSource({
 // ---------- handler ----------
 module.exports = async (req, res) => {
   try {
-    // Auth
     if (!INGEST_TOKEN || req.headers.authorization !== `Bearer ${INGEST_TOKEN}`) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
-
-    // GET = ping
     if (req.method === 'GET') return res.status(200).send('pong');
 
-    // Parse
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
     const parsed = schema.parse(body);
 
     // Company
     const company = await getOrCreateCompany(parsed.company);
 
-    // Source fields normalisés
+    // Source
     const source_type  = mapDocTypeEnum(parsed.source.doc_type);
     const published_at = safeDate(parsed.source.published_at);
     const source_md5   = parsed.source.source_md5 || null;
@@ -220,7 +216,6 @@ module.exports = async (req, res) => {
     const version      = parsed.source.version ?? 1;
     const provenance   = classifyProvenance(parsed.source.url);
 
-    // Source (idempotent + provenance)
     const sourceRow = await getOrCreateSource({
       company_id: company.id,
       url: parsed.source.url,
@@ -233,7 +228,6 @@ module.exports = async (req, res) => {
       provenance
     });
 
-    // Canonical sourceId via (company_id, url)
     const { data: srcCheck, error: srcCheckErr } = await supabase
       .from('sources')
       .select('id, trust_score')
@@ -256,9 +250,7 @@ module.exports = async (req, res) => {
           .upsert({ key_slug, label: f.metric_key }, { onConflict: 'key_slug' })
           .select()
           .single();
-        if (dict.error) {
-          return res.status(500).json({ error: `metrics_dictionary upsert: ${dict.error.message}` });
-        }
+        if (dict.error) return res.status(500).json({ error: `metrics_dictionary upsert: ${dict.error.message}` });
 
         factRows.push({
           company_id: company.id,
@@ -278,10 +270,7 @@ module.exports = async (req, res) => {
       }
       const { error: fErr } = await supabase.from('facts').insert(factRows);
       if (fErr && fErr.code !== '23505') {
-        return res.status(500).json({
-          error: `facts insert: ${fErr.message}`,
-          debug: { sourceIdUsed: factRows?.[0]?.source_id, companyId: company.id }
-        });
+        return res.status(500).json({ error: `facts insert: ${fErr.message}`, debug: { sourceIdUsed: factRows?.[0]?.source_id, companyId: company.id } });
       }
     }
 
@@ -301,10 +290,39 @@ module.exports = async (req, res) => {
       });
       const { error: iErr } = await supabase.from('insights').insert(insightRows);
       if (iErr && iErr.code !== '23505') {
-        return res.status(500).json({
-          error: `insights insert: ${iErr.message}`,
-          debug: { sourceIdUsed: insightRows?.[0]?.source_id, companyId: company.id }
+        return res.status(500).json({ error: `insights insert: ${iErr.message}`, debug: { sourceIdUsed: insightRows?.[0]?.source_id, companyId: company.id } });
+      }
+    }
+
+    // 🆕 News
+    if (parsed.news?.length) {
+      for (const n of parsed.news) {
+        const textBlob = `${n.headline || ''}\n${n.summary || ''}\n${n.full_text || ''}`;
+        const text_md5 = md5(textBlob);
+
+        const { data: dup } = await supabase
+          .from('news_events')
+          .select('id')
+          .eq('company_id', company.id)
+          .eq('source_id', sourceId)
+          .eq('text_md5', text_md5)
+          .maybeSingle();
+        if (dup) continue;
+
+        const { error: nErr } = await supabase.from('news_events').insert({
+          company_id: company.id,
+          source_id: sourceId,
+          event_date: safeDate(n.event_date) || published_at || new Date(),
+          headline: n.headline,
+          summary: n.summary || null,
+          full_text: n.full_text || null,
+          theme_enum: mapThemeEnum(n.theme),
+          importance: norm01(n.importance) ?? 0.6,
+          text_md5
         });
+        if (nErr && nErr.code !== '23505') {
+          return res.status(500).json({ error: `news insert: ${nErr.message}` });
+        }
       }
     }
 
