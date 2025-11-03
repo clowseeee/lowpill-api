@@ -1,4 +1,4 @@
-// /api/read.js — Lowpill v1.6.3 (fix: no .distinct(), JS dedup by date)
+// /api/read.js — Lowpill v1.6.4 (no .distinct, no .not; JS filtering/dedup)
 const { createClient } = require('@supabase/supabase-js');
 const { z } = require('zod');
 
@@ -20,23 +20,21 @@ const querySchema = z.object({
 });
 
 // -------- compute helpers ----------
-function computeChanges(series) {
-  // series must be ASC by date
-  for (let i = 0; i < series.length; i++) {
-    const cur = series[i];
-    const prev = i > 0 ? series[i - 1] : null;
+function computeChanges(seriesAsc) {
+  for (let i = 0; i < seriesAsc.length; i++) {
+    const cur = seriesAsc[i];
+    const prev = i > 0 ? seriesAsc[i - 1] : null;
     cur.qoq = prev && isFiniteNum(prev.value) && prev.value !== 0
       ? Number(((100 * (cur.value - prev.value)) / prev.value).toFixed(2))
       : null;
-    // YOY fallback = QoQ faute d’info périodicité
+    // fallback YOY
     cur.yoy = cur.qoq;
     cur.trend = isFiniteNum(cur.qoq)
       ? (cur.qoq > 0 ? 'up' : (cur.qoq < 0 ? 'down' : 'flat'))
       : 'flat';
   }
-  return series;
+  return seriesAsc;
 }
-
 function scoreToSignal(s) {
   if (s == null) return 'none';
   if (s >= 0.85) return 'strong';
@@ -45,7 +43,6 @@ function scoreToSignal(s) {
   return 'none';
 }
 
-// -------- handler ----------
 module.exports = async (req, res) => {
   try {
     if (req.method !== 'GET') {
@@ -73,21 +70,21 @@ module.exports = async (req, res) => {
     // 2) Metrics (optionnel)
     let metrics = {};
     if (parsed.metric) {
-      // NOTE: pas de .distinct() en supabase-js ; on filtre le NULL et on déduplique côté JS
       const { data: factRows, error: fErr } = await supabase
         .from('facts')
         .select('as_of_date, metric_value_num, metric_key')
         .eq('company_id', company.id)
         .eq('metric_key', parsed.metric)
-        .not('metric_value_num', 'is', null)   // filtre NOT NULL
         .order('as_of_date', { ascending: true });
       if (fErr) return res.status(500).json({ error: `facts select: ${fErr.message}` });
 
-      // Dédup par date si des doublons existent (garde la dernière valeur rencontrée)
+      // Filtrage NOT NULL et dédup par date côté JS
       const byDate = new Map();
       for (const r of factRows || []) {
+        if (r.metric_value_num == null) continue; // NOT NULL côté JS
         const d = r.as_of_date ? new Date(r.as_of_date).toISOString().slice(0,10) : null;
         if (!d) continue;
+        // garde la dernière valeur rencontrée pour cette date
         byDate.set(d, Number(r.metric_value_num));
       }
       const seriesAsc = Array.from(byDate.entries())
@@ -175,7 +172,7 @@ module.exports = async (req, res) => {
       return acc;
     }, {});
 
-    // 4) Narratives simples (si metric présent)
+    // 4) Narratives simples
     const narratives = [];
     if (parsed.metric && metrics[parsed.metric]?.series?.length) {
       for (const s of metrics[parsed.metric].series) {
@@ -199,13 +196,7 @@ module.exports = async (req, res) => {
     return res.status(200).json({
       company: { slug: company.slug, name: company.name, domain: company.domain ?? null },
       metrics,
-      insights: {
-        top: topInsights,
-        aggregates: {
-          avg_provenance_score: avgProv,
-          count_by_publisher_type: byType
-        }
-      },
+      insights: { top: topInsights, aggregates: { avg_provenance_score: avgProv, count_by_publisher_type: byType } },
       narratives
     });
 
