@@ -35,11 +35,13 @@ function computeChanges(seriesAsc) {
   }
   return seriesAsc;
 }
+
+// Nouveau barème: s = |qoq|/100 (ex: 12% -> 0.12)
 function scoreToSignal(s) {
   if (s == null) return 'none';
-  if (s >= 0.85) return 'strong';
-  if (s >= 0.65) return 'moderate';
-  if (s >= 0.50) return 'weak';
+  if (s >= 0.10) return 'strong';   // ≥ 10%
+  if (s >= 0.05) return 'moderate'; // 5–10%
+  if (s >= 0.02) return 'weak';     // 2–5%
   return 'none';
 }
 
